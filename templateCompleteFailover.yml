@@ -25,9 +25,6 @@ Resources:
         - !Ref InstanceSecurityGroup
       AvailabilityZone: !Select [ 0, !GetAZs '' ] # Launch in the first availability zone
 
-
-  
-
   # CloudWatch Alarm for Instance Status Check
   InstanceStatusCheckAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -83,63 +80,97 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "*"
-        - PolicyName: "AssignLoadBalancer"
+        - PolicyName: "ELBManagement"
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - elasticloadbalancing:RegisterTargets
-                Resource: "*" # Adjust to specific resources as necessary
+                  - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                Resource: "*"
 
-  # Lambda Function
-  LoadBalancerLambda:
+  # Lambda Function to manage instance failure
+  FailureHandlerLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: "AssignLoadBalancer"
-      Handler: "assign_load_balancer.lambda_handler"
+      FunctionName: "HandleInstanceFailure"
+      Handler: "failure_handler.lambda_handler"
       Role: !GetAtt LambdaExecutionRole.Arn
       Code:
         ZipFile: |
           import json
           import boto3
+          import os
 
           def lambda_handler(event, context):
-              # Example code to register an instance with a load balancer
-              instance_id = 'INSTANCE_ID'  # Replace with dynamic retrieval of instance ID
-              target_group_arn = 'TARGET_GROUP_ARN'  # Replace with actual Target Group ARN
+              ec2_client = boto3.client('ec2')
+              elb_client = boto3.client('elasticloadbalancing')
+
+              # Get id instance secondary
+              tag_key = os.environ['TAG_KEY']
+              tag_value = os.environ['TAG_VALUE']
+
+              # Fetching instances based on the tag
+              response = ec2_client.describe_instances(
+                  Filters=[
+                      {
+                          'Name': f'tag:{tag_key}',
+                          'Values': [tag_value]
+                      }
+                  ]
+              )
+
+              instance_ids = []
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_ids.append(instance['InstanceId'])
+
+              # Extract the failed instance ID from the CloudWatch event
+              instance_id = event['detail']['instance-id']
+              load_balancer_name = os.environ['LOAD_BALANCER_NAME']
               
-              client = boto3.client('elasticsearch')
-              
-              try:
-                  response = client.register_targets(
-                      TargetGroupArn=target_group_arn,
-                      Targets=[
-                          {
-                              'Id': instance_id,
-                          },
-                      ]
+              # Attempt to find a healthy instance (basic example)
+              healthy_instance_id = instance_ids[0]
+
+              # Deregister the failed instance from the load balancer
+              elb_client.deregister_instances_from_load_balancer(
+                  LoadBalancerName=load_balancer_name,
+                  Instances=[{'InstanceId': instance_id}]
+              )
+
+              # If a healthy instance was found, register it
+              if healthy_instance_id:
+                  elb_client.register_instances_with_load_balancer(
+                      LoadBalancerName=load_balancer_name,
+                      Instances=[{'InstanceId': healthy_instance_id}]
                   )
                   return {
-                    'statusCode': 200,
-                    'body': json.dumps('Instance registered with load balancer successfully')
+                      'statusCode': 200,
+                      'body': json.dumps(f'Instance {instance_id} deregistered and {healthy_instance_id} registered.')
                   }
-              except Exception as e:
+              else:
                   return {
                       'statusCode': 500,
-                      'body': json.dumps('Error: {}'.format(e))
+                      'body': json.dumps('No healthy instance found to register.')
                   }
-      Runtime: python3.8 # Choose your runtime
+
+      Runtime: python3.8 # Use your preferred Python runtime
       Timeout: 300
+      Environment:
+        LOAD_BALANCER_NAME: !Ref LoadBalancerDenodo # Reference to the load balancer
+        TAG_KEY: !Ref TagKey
+        TAG_VALUE: !Ref TagValue
       
   # Lambda Invoke Permission Switch LoadBalancer
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
-      FunctionName: !Ref LoadBalancerLambda
-      Principal: sns.amazonaws.com
-      SourceArn: !Ref NotificationTopic
+      FunctionName: !Ref FailureHandlerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:InstanceStatusCheckFailed
+
 
   # ------------------------------------------------------------------ Lambda Function New Instance EC2 ---------------------------------------------------------
   # IAM Role for Lambda Function
@@ -180,6 +211,8 @@ Resources:
 
           def lambda_handler(event, context):
               ec2 = boto3.resource('ec2')
+              tag_key = os.environ['TAG_KEY']
+              tag_value = os.environ['TAG_VALUE']
 
               # Define parameters for the new instance
               instances = ec2.create_instances(
@@ -188,7 +221,14 @@ Resources:
                   MaxCount=1,
                   InstanceType='t2.micro',  # You can change this to your required type
                   KeyName=os.environ['KEY_NAME'],
-                  SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']]
+                  SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
+                  SubnetId: os.environ['SUBNET_ID'],
+                  Tags=[
+                      {
+                          'Key': tag_key,
+                          'Value': tag_value
+                      }
+                  ]
               )
 
               return {
@@ -201,6 +241,9 @@ Resources:
         AMI_ID: ami-0c55b159cbfafe1f0 # Replace with your valid AMI ID
         KEY_NAME: !Ref KeyName
         SECURITY_GROUP_ID: !Ref InstanceSecurityGroup
+        SUBNET_ID: !Ref SubnetEC2Secondary
+        TAG_KEY: !Ref TagKey
+        TAG_VALUE: !Ref TagValue
 
   # Lambda Invoke Permission New Instance
   LaunchNewInstancePermission:
@@ -228,3 +271,12 @@ Parameters:
   InstanceSecurityGroup:
     Description: SecurityGroup for instances EC2
     Type: AWS::EC2::SecurityGroup
+  SubnetEC2Secondary:
+    Description: Subnet for instances EC2 secondary
+    Type: AWS::EC2::Subnet
+  TagKey:
+    Description: Tag key to search for
+    Type: String
+  TagValue:
+    Description: Tag value to search for
+    Type: String
