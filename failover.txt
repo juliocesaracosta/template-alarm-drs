@@ -1,0 +1,15 @@
+# Step 1: List recovery instances
+aws drs describe-recovery-instances --region us-east-1
+
+# Step 2: List recovery plans
+aws drs describe-recovery-plans --region us-east-1
+
+# Step 3: Start failover (example ARN and recovery instance IDs)
+aws drs start-failover \
+    --recovery-plan-arn arn:aws:drs:us-east-1:123456789012:recovery-plan:example-recovery-plan-arn \
+    --region us-east-1 \
+    --use-latest-replication \
+    --failover-recovery-instance-ids i-0123456789abcdef0,i-0fedcba9876543210
+
+# Step 4: Check the status of the recovery instances
+aws drs describe-recovery-instances --region us-east-1

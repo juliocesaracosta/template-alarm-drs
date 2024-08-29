@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Launch a new EC2 instance automatically when the monitored instance fails.
+
+Resources:
+
+  # VPC for the EC2 Instances
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+
+  # Public Subnet
+  MySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  # Security Group for the EC2 Instance
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and HTTP access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # SSH access
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0 # HTTP access
+
+  # Existing EC2 Instance to Monitor
+  MyExistingInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName # Replace with your key name
+      ImageId: ami-0c55b159cbfafe1f0 # Replace with a valid AMI ID
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      SubnetId: !Ref MySubnet
+
+  # CloudWatch Alarm for Instance Status Check
+  InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "InstanceStatusCheckFailed"
+      AlarmDescription: "Triggered when the EC2 instance fails status checks."
+      MetricName: "StatusCheckFailed_Instance"
+      Namespace: "AWS/EC2"
+      Statistic: "Sum"
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanThreshold"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: !Ref MyExistingInstance
+      AlarmActions:
+        - !GetAtt LaunchNewInstancePermission.Arn
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "CreateEC2Policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                  - ec2:DescribeInstances
+                Resource: "*"
+
+  # Lambda Function
+  LaunchNewInstanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "LaunchNewEC2Instance"
+      Handler: "launch_new_instance.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              ec2 = boto3.resource('ec2')
+
+              # Define parameters for the new instance
+              instances = ec2.create_instances(
+                  ImageId=os.environ['AMI_ID'],
+                  MinCount=1,
+                  MaxCount=1,
+                  InstanceType='t2.micro',  # You can change this to your required type
+                  KeyName=os.environ['KEY_NAME'],
+                  SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']]
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'New instance created: {instances[0].id}')
+              }
+      Runtime: python3.8 # Choose your preferred runtime
+      Timeout: 300
+      Environment:
+        AMI_ID: ami-0c55b159cbfafe1f0 # Replace with your valid AMI ID
+        KEY_NAME: !Ref KeyName
+        SECURITY_GROUP_ID: !Ref InstanceSecurityGroup
+
+  # Lambda Invoke Permission
+  LaunchNewInstancePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref LaunchNewInstanceFunction
+      Principal: "cloudwatch.amazonaws.com"
+      SourceArn: !GetAtt InstanceStatusCheckAlarm.Arn
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: AWS::EC2::KeyPair::KeyName

@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for failure detection of a single EC2 instance and launching a Lambda function to assign a load balancer.
+
+Resources:
+  # Security Group for EC2 Instance
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access
+      VpcId: !Ref VPCId # Replace with your VPC ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # SSH access - adjust as necessary
+
+  # EC2 Instance
+  MyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro # Replace with your instance type
+      KeyName: !Ref KeyName # Replace with your key name
+      ImageId: ami-0c55b159cbfafe1f0 # Replace with appropriate AMI ID
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      AvailabilityZone: !Select [ 0, !GetAZs '' ] # Launch in the first availability zone
+
+  # CloudWatch Alarm for Instance Status Check
+  InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "InstanceStatusCheckFailed"
+      AlarmDescription: "Alarm when EC2 instance has status check failures."
+      Namespace: "AWS/EC2"
+      MetricName: "StatusCheckFailed_System"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: !Ref MyInstance
+      Statistic: "Sum"
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !Ref LambdaInvokePermission
+        - !Ref NotificationTopic # Notify when the alarm triggers
+      OKActions:
+        - !Ref NotificationTopic # Notify when the alarm goes back to OK
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAddress # Insert email address for notifications
+          Protocol: email
+
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "LambdaBasicExecution"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: "AssignLoadBalancer"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:RegisterTargets
+                Resource: "*" # Adjust to specific resources as necessary
+
+  # Lambda Function
+  LoadBalancerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "AssignLoadBalancer"
+      Handler: "assign_load_balancer.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              # Example code to register an instance with a load balancer
+              instance_id = 'INSTANCE_ID'  # Replace with dynamic retrieval of instance ID
+              target_group_arn = 'TARGET_GROUP_ARN'  # Replace with actual Target Group ARN
+              
+              client = boto3.client('elasticsearch')
+              
+              try:
+                  response = client.register_targets(
+                      TargetGroupArn=target_group_arn,
+                      Targets=[
+                          {
+                              'Id': instance_id,
+                          },
+                      ]
+                  )
+                  return {
+                    'statusCode': 200,
+                    'body': json.dumps('Instance registered with load balancer successfully')
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('Error: {}'.format(e))
+                  }
+      Runtime: python3.8 # Choose your runtime
+      Timeout: 300
+      
+  # Lambda Invoke Permission
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LoadBalancerLambda
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref NotificationTopic
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+  VPCId:
+    Description: VPC ID where the resources will be created
+    Type: AWS::EC2::VPC::Id
+  EmailAddress:
+    Description: eMail address to receive notifications (for SNS)
+    Type: String

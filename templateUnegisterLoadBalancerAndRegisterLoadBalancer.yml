@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for failure detection of a single EC2 instance with Lambda handling.
+
+Resources:
+
+  # Security Group for EC2 Instance
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH access
+      VpcId: !Ref VPCId # Replace with your VPC ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # Adjust as necessary
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0 # Allow HTTP access
+
+  # EC2 Instance
+  MyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro # Replace with your instance type
+      KeyName: !Ref KeyName # Replace with your key name
+      ImageId: ami-0c55b159cbfafe1f0 # Replace with an appropriate AMI ID
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      AvailabilityZone: !Select [0, !GetAZs ''] # Launch in the first availability zone
+
+  # Elastic Load Balancer
+  MyLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      AvailabilityZones:
+        - !Select [0, !GetAZs ''] # Use the first AZ
+      Listeners:
+        - LoadBalancerPort: 80
+          InstancePort: 80
+      HealthCheck:
+        Target: HTTP:80/
+        HealthyThreshold: 2
+        UnhealthyThreshold: 2
+        Interval: 30
+        Timeout: 3
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+
+  # CloudWatch Alarm for Instance Status Check
+  InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "InstanceStatusCheckFailed"
+      AlarmDescription: "Trigger when the EC2 instance fails health checks."
+      Namespace: "AWS/EC2"
+      MetricName: "StatusCheckFailed_System"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: !Ref MyInstance
+      Statistic: "Sum"
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !Ref LambdaInvokePermission
+      OKActions:
+        - !Ref NotificationTopic # Optional: Notify when the alarm returns to normal
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "LambdaBasicExecution"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: "ELBManagement"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                Resource: "*"
+
+  # Lambda Function to manage instance failure
+  FailureHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "HandleInstanceFailure"
+      Handler: "failure_handler.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              ec2_client = boto3.client('ec2')
+              elb_client = boto3.client('elasticloadbalancing')
+
+              # Extract the failed instance ID from the CloudWatch event
+              instance_id = event['detail']['instance-id']
+              load_balancer_name = os.environ['LOAD_BALANCER_NAME']
+              
+              # Attempt to find a healthy instance (basic example)
+              healthy_instance_id = find_healthy_instance(instance_id)
+
+              # Deregister the failed instance from the load balancer
+              elb_client.deregister_instances_from_load_balancer(
+                  LoadBalancerName=load_balancer_name,
+                  Instances=[{'InstanceId': instance_id}]
+              )
+
+              # If a healthy instance was found, register it
+              if healthy_instance_id:
+                  elb_client.register_instances_with_load_balancer(
+                      LoadBalancerName=load_balancer_name,
+                      Instances=[{'InstanceId': healthy_instance_id}]
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Instance {instance_id} deregistered and {healthy_instance_id} registered.')
+                  }
+              else:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('No healthy instance found to register.')
+                  }
+
+          def find_healthy_instance(failed_instance_id):
+              ec2_client = boto3.client('ec2')
+
+              # Example logic to find a running instance (you may need to customize this)
+              running_instances = ec2_client.describe_instances(
+                  Filters=[
+                      {
+                          'Name': 'instance-state-name',
+                          'Values': ['running']
+                      },
+                      {
+                          'Name': 'instance-id',
+                          'Values': [failed_instance_id],  # Exclude the failed instance
+                          'Values': ['i-XXXXXXX'] # Replace with logic to dynamically find another healthy instance
+                      }
+                  ]
+              )
+
+              # If there are instances that are running, return the first one found
+              for reservation in running_instances['Reservations']:
+                  for instance in reservation['Instances']:
+                      if instance['InstanceId'] != failed_instance_id:
+                          return instance['InstanceId']
+              return None
+
+      Runtime: python3.8 # Use your preferred Python runtime
+      Timeout: 300
+      Environment:
+        LOAD_BALANCER_NAME: !Ref MyLoadBalancer # Reference to the load balancer
+
+  # Lambda Invoke Permission
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FailureHandlerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:InstanceStatusCheckFailed
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+  VPCId:
+    Description: VPC ID where the resources will be created
+    Type: AWS::EC2::VPC::Id
+  EmailAddress:
+    Description: eMail address to receive notifications (for SNS)
+    Type: String
