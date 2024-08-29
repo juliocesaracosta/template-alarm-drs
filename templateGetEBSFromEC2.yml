@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to monitor EC2 instance and retrieve EBS volumes.
+
+Parameters:
+  KeyName:
+    Description: Name of the EC2 Key Pair
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceId:
+    Description: ID of the EC2 instance to monitor
+    Type: String
+  VpcId:
+    Description: The ID of the VPC where the instance resides
+    Type: String
+  SubnetId:
+    Description: The ID of the Subnet where the instance resides
+    Type: String
+
+Resources:
+  
+  # Security Group for the EC2 Instance
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and HTTP access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # Allow SSH
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0  # Allow HTTP
+
+  # EC2 Instance to Monitor
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-0c55b159cbfafe1f0  # Replace with a valid AMI ID
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      SubnetId: !Ref SubnetId
+
+  # CloudWatch Alarm for Instance Status Check
+  InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "EC2InstanceStatusCheckFailed"
+      AlarmDescription: "Triggered when the EC2 instance fails status checks."
+      MetricName: "StatusCheckFailed_Instance"
+      Namespace: "AWS/EC2"
+      Statistic: "Sum"
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanThreshold"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: !Ref MyEC2Instance
+      AlarmActions: !Ref FetchEBSDetailsFunctionArn
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaGetEBSActionsRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "EC2DescribeVolumesPolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeInstances
+                Resource: "*"
+
+  # Lambda Function to Retrieve EBS Volumes
+  FetchEBSDetailsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "FetchEBSDetailsLambda"
+      Handler: "fetch_ebs.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+
+              instance_id = event['Records'][0]['Sns']['Message']  # The message passed from the SNS Topic if applicable
+              
+              # Retrieve the instance's EBS volumes and other details
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              
+              volumes = []
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      for block_device in instance['BlockDeviceMappings']:
+                          volumes.append(block_device['Ebs']['VolumeId'])
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(volumes)
+              }
+      Runtime: python3.8
+      Timeout: 30
+
+  # SNS Topic for Alarm Notifications
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: "<your-email@example.com>"  # Replace with your email for notifications
+          Protocol: email
+
+Outputs:
+  InstanceId:
+    Description: "Instance ID of the EC2 instance"
+    Value: !Ref MyEC2Instance
+
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt FetchEBSDetailsFunction.Arn

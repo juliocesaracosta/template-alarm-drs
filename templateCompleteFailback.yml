@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to perform failback with AWS Elastic Disaster Recovery.
+
+Parameters:
+  RecoveryInstanceARN:
+    Description: The ARN of the recovery instance for failback
+    Type: String
+  RecoveryInstanceId:
+    Description: The ID of the recovery instance for failback
+    Type: String
+  KeyName:
+    Description: The name of the EC2 Key Pair
+    Type: AWS::EC2::KeyPair::KeyName
+  TagKey:
+    Description: Tag key to search for
+    Type: String
+  TagValue:
+    Description: Tag value to search for
+    Type: String
+  LoadBalancerDenodo:
+    Description: Name loadbalancer
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+
+Resources:
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaEDRFailbackRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "EDRFailbackPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - drs:StartFailback
+                  - drs:DescribeRecoveryInstances
+                Resource: "*"
+        - PolicyName: "LambdaBasicExecution"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: "ELBManagement"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                Resource: "*"
+
+  # Lambda Function to perform failback
+  EDRFailbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "EDRFailbackFunction"
+      Handler: "edr_failback.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              drs_client = boto3.client('drs')
+              load_balancer_name = os.environ['LOAD_BALANCER_NAME']
+
+              # Fetching instances based on the tag
+              responseEC2Secondary = ec2_client.describe_instances(
+                  Filters=[
+                      {
+                          'Name': f'tag:{tag_key}',
+                          'Values': [tag_value]
+                      }
+                  ]
+              )
+
+              instance_ids_secondary = []
+              for reservation in responseEC2Secondary['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_ids_secondary.append(instance['InstanceId'])
+
+              # Deregister the failed instance from the load balancer
+              elb_client.deregister_instances_from_load_balancer(
+                  LoadBalancerName=load_balancer_name,
+                  Instances=[{'InstanceId': instance_ids_secondary[0]}]
+              )
+
+              # Get the Recovery Instance ARN from the environment variable or the event
+              recovery_instance_arn = os.environ.get('RECOVERY_INSTANCE_ARN', event.get('RecoveryInstanceARN'))
+
+              # Start failback
+              response = drs_client.start_failback(
+                  recoveryInstanceArn=recovery_instance_arn
+              )
+
+              elb_client.register_instances_with_load_balancer(
+                  LoadBalancerName=load_balancer_name,
+                  Instances=[{'InstanceId': os.environ['RECOVERY_INSTANCE_ID']}]
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Failback operation started.',
+                      'response': response
+                  })
+              }
+      Runtime: python3.8
+      Timeout: 30
+      Environment:
+        RECOVERY_INSTANCE_ARN: !Ref RecoveryInstanceARN
+        LOAD_BALANCER_NAME: !Ref LoadBalancerDenodo
+        TAG_KEY: !Ref TagKey
+        TAG_VALUE: !Ref TagValue
+        RECOVERY_INSTANCE_ID: !Ref RecoveryInstanceId
+
+Outputs:
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt EDRFailbackFunction.Arn
+
+  LambdaExecutionRoleArn:
+    Description: "The ARN of the Lambda function execution role"
+    Value: !GetAtt LambdaExecutionRole.Arn

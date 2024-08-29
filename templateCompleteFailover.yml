@@ -130,7 +130,7 @@ Resources:
               instance_id = event['detail']['instance-id']
               load_balancer_name = os.environ['LOAD_BALANCER_NAME']
               
-              # Attempt to find a healthy instance (basic example)
+              # Attempt to find a healthy instance
               healthy_instance_id = instance_ids[0]
 
               # Deregister the failed instance from the load balancer
@@ -213,6 +213,8 @@ Resources:
               ec2 = boto3.resource('ec2')
               tag_key = os.environ['TAG_KEY']
               tag_value = os.environ['TAG_VALUE']
+              instance_id = os.environ['INSTANCE_EBS']
+              volume = os.environ['VOLUME_EBS']
 
               # Define parameters for the new instance
               instances = ec2.create_instances(
@@ -231,6 +233,12 @@ Resources:
                   ]
               )
 
+              ec2.attach_volume(
+                  VolumeId= volume,
+                  InstanceId= instances[0].id,
+                  Device='/dev/sdf'  # Modify device name as per your requirement
+              )
+
               return {
                   'statusCode': 200,
                   'body': json.dumps(f'New instance created: {instances[0].id}')
@@ -244,6 +252,7 @@ Resources:
         SUBNET_ID: !Ref SubnetEC2Secondary
         TAG_KEY: !Ref TagKey
         TAG_VALUE: !Ref TagValue
+        VOLUME_EBS: !Ref VolumeEBS
 
   # Lambda Invoke Permission New Instance
   LaunchNewInstancePermission:
@@ -266,7 +275,7 @@ Parameters:
     Description: eMail address to receive notifications (for SNS)
     Type: String
   LoadBalancerDenodo:
-    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Description: Name of Loadbalancer
     Type: AWS::ElasticLoadBalancing::LoadBalancer
   InstanceSecurityGroup:
     Description: SecurityGroup for instances EC2
@@ -280,3 +289,15 @@ Parameters:
   TagValue:
     Description: Tag value to search for
     Type: String
+  InstanceEC2EBS:
+    Description: Instance where is EBS
+    Type: String
+  VpcEBS:
+    Description: VPC where is instance EBS
+    Type: String
+  SubnetEBS:
+    Description: Subnet where is instance EBS
+    Type: String
+  VolumeEBS:
+    Description: Volume EBS for recovery
+    Type: AWS::EC2::Volume
