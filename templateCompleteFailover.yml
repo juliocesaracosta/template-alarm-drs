@@ -2,29 +2,6 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: CloudFormation template for failure detection of a single EC2 instance and launching a Lambda function to assign a load balancer.
 
 Resources:
-  # Security Group for EC2 Instance
-  InstanceSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Enable SSH access
-      VpcId: !Ref VPCId # Replace with your VPC ID
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0 # SSH access - adjust as necessary
-
-  # EC2 Instance
-  MyInstance:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t2.micro # Replace with your instance type
-      KeyName: !Ref KeyName # Replace with your key name
-      ImageId: ami-0c55b159cbfafe1f0 # Replace with appropriate AMI ID
-      SecurityGroupIds:
-        - !Ref InstanceSecurityGroup
-      AvailabilityZone: !Select [ 0, !GetAZs '' ] # Launch in the first availability zone
-
   # CloudWatch Alarm for Instance Status Check
   InstanceStatusCheckAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -89,6 +66,16 @@ Resources:
                   - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
                   - elasticloadbalancing:RegisterInstancesWithLoadBalancer
                 Resource: "*"
+        - PolicyName: AllowStartRecovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - drs:StartRecovery
+                  - drs:DescribeRecovery
+                  - drs:ListRecoveryInstances
+                Resource: "*"
 
   # Lambda Function to manage instance failure
   FailureHandlerLambda:
@@ -106,32 +93,11 @@ Resources:
           def lambda_handler(event, context):
               ec2_client = boto3.client('ec2')
               elb_client = boto3.client('elasticloadbalancing')
-
-              # Get id instance secondary
-              tag_key = os.environ['TAG_KEY']
-              tag_value = os.environ['TAG_VALUE']
-
-              # Fetching instances based on the tag
-              response = ec2_client.describe_instances(
-                  Filters=[
-                      {
-                          'Name': f'tag:{tag_key}',
-                          'Values': [tag_value]
-                      }
-                  ]
-              )
-
-              instance_ids = []
-              for reservation in response['Reservations']:
-                  for instance in reservation['Instances']:
-                      instance_ids.append(instance['InstanceId'])
+              drs_client = boto3.client('drs')
 
               # Extract the failed instance ID from the CloudWatch event
               instance_id = event['detail']['instance-id']
               load_balancer_name = os.environ['LOAD_BALANCER_NAME']
-              
-              # Attempt to find a healthy instance
-              healthy_instance_id = instance_ids[0]
 
               # Deregister the failed instance from the load balancer
               elb_client.deregister_instances_from_load_balancer(
@@ -139,15 +105,40 @@ Resources:
                   Instances=[{'InstanceId': instance_id}]
               )
 
-              # If a healthy instance was found, register it
-              if healthy_instance_id:
-                  elb_client.register_instances_with_load_balancer(
-                      LoadBalancerName=load_balancer_name,
-                      Instances=[{'InstanceId': healthy_instance_id}]
+              try:
+                  # Replace 'your-recovery-instance-id' with the actual Recovery Instance ID
+                  res_recovery = drs_client.start_recovery(
+                    isDrill=True|False,
+                    sourceServers=[
+                          {
+                              'sourceServerID': os.environ['SOURCE_SERVER_ID']
+                          },
+                      ],
+                    tags={
+                        'ProccessRecoveryTest': 'testRecovery'
+                    }
                   )
                   return {
                       'statusCode': 200,
-                      'body': json.dumps(f'Instance {instance_id} deregistered and {healthy_instance_id} registered.')
+                      'body': json.dumps('Recovery started successfully: ' + response['taskId'])
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Error starting recovery: ' + str(e))
+                  }
+              
+              instance_recovery_id = res_recovery.job.participatingServers[0].recoveryInstanceID
+
+              # If a healthy instance was found, register it
+              if instance_recovery_id:
+                  elb_client.register_instances_with_load_balancer(
+                      LoadBalancerName=load_balancer_name,
+                      Instances=[{'InstanceId': instance_recovery_id}]
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Instance {instance_id} deregistered and {instance_recovery_id} registered.')
                   }
               else:
                   return {
@@ -158,9 +149,8 @@ Resources:
       Runtime: python3.8 # Use your preferred Python runtime
       Timeout: 300
       Environment:
-        LOAD_BALANCER_NAME: !Ref LoadBalancerDenodo # Reference to the load balancer
-        TAG_KEY: !Ref TagKey
-        TAG_VALUE: !Ref TagValue
+        LOAD_BALANCER_NAME: !Ref LoadBalancerDenodo
+        SOURCE_SERVER_ID: !Ref InstanceEDR
       
   # Lambda Invoke Permission Switch LoadBalancer
   LambdaInvokePermission:
@@ -170,99 +160,6 @@ Resources:
       FunctionName: !Ref FailureHandlerLambda
       Principal: events.amazonaws.com
       SourceArn: !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:InstanceStatusCheckFailed
-
-
-  # ------------------------------------------------------------------ Lambda Function New Instance EC2 ---------------------------------------------------------
-  # IAM Role for Lambda Function
-  LambdaExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: "LambdaExecutionRole"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: "CreateEC2Policy"
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ec2:RunInstances
-                  - ec2:DescribeInstances
-                Resource: "*"
-
-  # Lambda Function
-  LaunchNewInstanceFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: "LaunchNewEC2Instance"
-      Handler: "launch_new_instance.lambda_handler"
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Code:
-        ZipFile: |
-          import json
-          import boto3
-          import os
-
-          def lambda_handler(event, context):
-              ec2 = boto3.resource('ec2')
-              tag_key = os.environ['TAG_KEY']
-              tag_value = os.environ['TAG_VALUE']
-              instance_id = os.environ['INSTANCE_EBS']
-              volume = os.environ['VOLUME_EBS']
-
-              # Define parameters for the new instance
-              instances = ec2.create_instances(
-                  ImageId=os.environ['AMI_ID'],
-                  MinCount=1,
-                  MaxCount=1,
-                  InstanceType='t2.micro',  # You can change this to your required type
-                  KeyName=os.environ['KEY_NAME'],
-                  SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
-                  SubnetId: os.environ['SUBNET_ID'],
-                  Tags=[
-                      {
-                          'Key': tag_key,
-                          'Value': tag_value
-                      }
-                  ]
-              )
-
-              ec2.attach_volume(
-                  VolumeId= volume,
-                  InstanceId= instances[0].id,
-                  Device='/dev/sdf'  # Modify device name as per your requirement
-              )
-
-              return {
-                  'statusCode': 200,
-                  'body': json.dumps(f'New instance created: {instances[0].id}')
-              }
-      Runtime: python3.8 # Choose your preferred runtime
-      Timeout: 300
-      Environment:
-        AMI_ID: ami-0c55b159cbfafe1f0 # Replace with your valid AMI ID
-        KEY_NAME: !Ref KeyName
-        SECURITY_GROUP_ID: !Ref InstanceSecurityGroup
-        SUBNET_ID: !Ref SubnetEC2Secondary
-        TAG_KEY: !Ref TagKey
-        TAG_VALUE: !Ref TagValue
-        VOLUME_EBS: !Ref VolumeEBS
-
-  # Lambda Invoke Permission New Instance
-  LaunchNewInstancePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: "lambda:InvokeFunction"
-      FunctionName: !Ref 
-      
-      Principal: "cloudwatch.amazonaws.com"
-      SourceArn: !GetAtt InstanceStatusCheckAlarm.Arn
 
 Parameters:
   KeyName:
@@ -277,27 +174,6 @@ Parameters:
   LoadBalancerDenodo:
     Description: Name of Loadbalancer
     Type: AWS::ElasticLoadBalancing::LoadBalancer
-  InstanceSecurityGroup:
-    Description: SecurityGroup for instances EC2
-    Type: AWS::EC2::SecurityGroup
-  SubnetEC2Secondary:
-    Description: Subnet for instances EC2 secondary
-    Type: AWS::EC2::Subnet
-  TagKey:
-    Description: Tag key to search for
-    Type: String
-  TagValue:
-    Description: Tag value to search for
-    Type: String
-  InstanceEC2EBS:
-    Description: Instance where is EBS
-    Type: String
-  VpcEBS:
-    Description: VPC where is instance EBS
-    Type: String
-  SubnetEBS:
-    Description: Subnet where is instance EBS
-    Type: String
-  VolumeEBS:
-    Description: Volume EBS for recovery
-    Type: AWS::EC2::Volume
+  InstanceEDR:
+    Description: Intance EDR
+    Type: AWS::EC2::Instance
