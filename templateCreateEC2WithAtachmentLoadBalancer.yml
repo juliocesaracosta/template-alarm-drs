@@ -1,0 +1,108 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to create an Application Load Balancer and attach it to an EC2 Instance
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 Instance type
+
+  InstanceName:
+    Type: String
+    Default: MyInstance
+    Description: Name of the EC2 instance
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC ID where the resources will be created.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The Subnet IDs where the resources will be created. Must be at least 2 subnets in different AZs.
+
+Resources:
+
+  # Security Group for the Load Balancer
+  LoadBalancerSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+
+  # Security Group for the EC2 Instance
+  InstanceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0  # Update this for production use!
+
+  # EC2 Instance
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-04fdea8e25817cd69  # Replace with a valid AMI ID
+      SecurityGroupIds:
+        - !Ref InstanceSg
+      SubnetId: !Select [0, !Ref SubnetIds]  # Use the first subnet in the list
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+
+  # Application Load Balancer
+  MyLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: MyApplicationLoadBalancer
+      Subnets: !Ref SubnetIds  # Use the list of subnets
+      SecurityGroups:
+        - !Ref LoadBalancerSg
+      Scheme: internet-facing
+
+  # Target Group for the Load Balancer
+  MyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: MyTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '80'
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Targets:
+        - Id: !Ref MyEC2Instance  # Registering the EC2 instance to the target group
+
+  # Listener for the Load Balancer
+  MyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref MyLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref MyTargetGroup
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS address of the Load Balancer
+    Value: !GetAtt MyLoadBalancer.DNSName
+  InstanceId:
+    Description: The Instance ID
+    Value: !Ref MyEC2Instance

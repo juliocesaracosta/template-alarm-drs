@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for failure detection of a single EC2 instance and launching a Lambda function to assign a load balancer.
+
+Parameters:
+  LoadBalancerDenodo:
+    Description: Name of Loadbalancer
+    Default: MyApplicationLoadBalancer
+    Type: String
+  InstanceRecovery:
+    Type: String
+    Default: i-0ff6e768f7170f80e
+    Description: The ID of the existing EC2 instance (e.g., i-0123456789abcdef0)
+
+Resources:
+  # ------------------------------------------------------------------ Lambda Function Switch LoadBalancer ---------------------------------------------------------
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "LambdaBasicExecution"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: "ELBManagement"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                Resource: "*"
+        - PolicyName: AllowStartRecovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - drs:StartRecovery
+                  - drs:DescribeRecovery
+                  - drs:ListRecoveryInstances
+                Resource: "*"
+
+  # Lambda Function to manage instance failure
+  FailureHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "HandleInstanceFailure"
+      Handler: "failure_handler.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12 # Use your preferred Python runtime
+      Environment:
+        Variables:
+          LOAD_BALANCER_DENODO: !Ref LoadBalancerDenodo
+          INSTANCE_RECOVERY: !Ref InstanceRecovery
+      Code:
+        ZipFile: |
+          import os
+          import json
+
+          def lambda_handler(event, context):
+              load_balancer_name = os.environ['LOAD_BALANCER_DENODO']  # Ensure this matches
+              recovery_id = os.environ['INSTANCE_RECOVERY']       # Ensure this matches
+              
+              # Your logic to handle the load balancer and recovery operations goes here
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Function executed successfully')
+              }
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FailureHandlerLambda
+      Principal: events.amazonaws.com

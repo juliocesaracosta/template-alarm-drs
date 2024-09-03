@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to create a CloudWatch alarm linked to a Lambda function for EC2 instance recovery.
+
+Parameters:
+  LoadBalancerName:
+    Description: Name of the Load Balancer
+    Type: String
+    Default: MyApplicationLoadBalancer
+  InstanceId:
+    Type: String
+    Description: The ID of the existing EC2 instance (e.g., i-0123456789abcdef0)
+    Default: i-0faf9f3293dcff156
+  RecoveryInstance:
+    Type: String
+    Description: The ID of the instance to recover (e.g., i-0123456789abcdef0)
+    Default: i-0ff6e768f7170f80e
+
+Resources:
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "LambdaBasicExecution"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: "ELBManagement"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                Resource: "*"
+        - PolicyName: "DRSManagement"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - drs:StartRecovery
+                  - drs:DescribeRecovery
+                  - drs:ListRecoveryInstances
+                Resource: "*"
+
+  # Lambda Function
+  FailureHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "HandleInstanceFailure"
+      Handler: "failure_handler.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Environment:
+        Variables:
+          LOAD_BALANCER_DENODO: !Ref LoadBalancerName
+          INSTANCE_RECOVERY: !Ref RecoveryInstance
+      Code:
+        ZipFile: |
+          import os
+          import json
+
+          def lambda_handler(event, context):
+              load_balancer_name = os.environ['LOAD_BALANCER_NAME']
+              recovery_id = os.environ['INSTANCE_RECOVERY']
+              
+              # Add your logic to handle the load balancer and instance recovery operations here
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Handled failure for instance: {recovery_id} with load balancer: {load_balancer_name}')
+              }
+
+  # CloudWatch Alarm for Instance Status Check
+  InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "InstanceStatusCheckFailed"
+      AlarmDescription: "Alarm when EC2 instance has status check failures."
+      Namespace: "AWS/EC2"
+      MetricName: "StatusCheckFailed_System"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: !Ref InstanceId
+      Statistic: "Sum"
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !GetAtt LambdaInvokePermission.FunctionName  # Go to learn more about acknowledging resource ARNs
+      OKActions: []
+
+  # Lambda Invoke Permission
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FailureHandlerLambda
+      Principal: cloudwatch.amazonaws.com  # Allow CloudWatch to invoke this function
+      SourceArn: !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:InstanceStatusCheckFailed  # Correct ARN for the CloudWatch Alarm
+
+Outputs:
+  LambdaFunctionARN:
+    Description: ARN of the Lambda Function
+    Value: !GetAtt FailureHandlerLambda.Arn
+  InstanceStatusCheckAlarmARN:
+    Description: ARN of the CloudWatch Alarm
+    Value: !GetAtt InstanceStatusCheckAlarm.Arn
